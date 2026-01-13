@@ -32,7 +32,7 @@ ALL_HEADERS += $(BPF_HEADERS)
 ALL_OBJS += $(BPF_OBJS)
 
 VM_HEADERS = vmpressure.skel.h
-VM_OBJS = vmpressured.o
+VM_OBJS = vmpressured.o vmpressured-state.o
 ALL_HEADERS += $(VM_HEADERS)
 ALL_OBJS += $(VM_OBJS)
 
