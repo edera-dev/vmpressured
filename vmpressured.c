@@ -229,6 +229,22 @@ static void maybe_protect_from_oom(void)
 		fprintf(stderr, "warning: cannot set oom_score_adj: %s\n", strerror(-r));
 }
 
+static int eventloop_register(int ep_fd, int fd, enum fd_tag tag)
+{
+	struct epoll_event ev = {
+		.events = EPOLLIN,
+		.data.u32 = tag,
+	};
+
+	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+	{
+		fprintf(stderr, "epoll_ctl add (tag=%u): %s\n", tag, strerror(errno));
+		return -errno;
+	}
+
+	return 0;
+}
+
 int main(void)
 {
 	signal(SIGINT, sigint_handler);
@@ -323,42 +339,23 @@ int main(void)
 		return 1;
 	}
 
-	struct epoll_event ev_ringbuf = {
-		.events = EPOLLIN,
-		.data.u32 = FD_RINGBUF,
-	};
-
-	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, rb_fd, &ev_ringbuf) < 0)
+	if (eventloop_register(ep_fd, rb_fd, FD_RINGBUF) < 0)
 	{
-		fprintf(stderr, "epoll_ctl ringbuf: %s\n", strerror(errno));
-
 		ring_buffer__free(rb);
 		vmpressure_bpf__destroy(skel);
 		vmpressure_observer_fini(observer);
 	}
 
 	int tfd = make_timerfd();
-	struct epoll_event ev_timerfd = {
-		.events = EPOLLIN,
-		.data.u32 = FD_TIMERFD,
-	};
-
-	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, tfd, &ev_timerfd) < 0)
+	if (eventloop_register(ep_fd, tfd, FD_TIMERFD) < 0)
 	{
-		fprintf(stderr, "epoll_ctl timerfd: %s\n", strerror(errno));
-
 		ring_buffer__free(rb);
 		vmpressure_bpf__destroy(skel);
 		vmpressure_observer_fini(observer);
 	}
 
 	int lfd = vmpressure_broadcaster_fd(broadcaster);
-	struct epoll_event ev_listener = {
-		.events = EPOLLIN,
-		.data.u32 = FD_LISTENER,
-	};
-
-	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, lfd, &ev_listener) < 0)
+	if (eventloop_register(ep_fd, lfd, FD_LISTENER) < 0)
 	{
 		fprintf(stderr, "epoll_ctl timerfd: %s\n", strerror(errno));
 
