@@ -86,7 +86,7 @@ int BPF_PROG(on_wakeup_kswapd,
 	clear_vmstats(e);
 
 	e->type = EV_KSWAPD_WAKE;
-	e->ts_ns = bpf_ktime_get_ns();
+	e->ts_nsec = bpf_ktime_get_ns();
 	e->cpu = bpf_get_smp_processor_id();
 	e->nid = (__u32) BPF_CORE_READ(pgdat, node_id);
 	e->order = (__u32) order;
@@ -108,7 +108,7 @@ int BPF_PROG(on_try_to_free_pages,
 	clear_vmstats(e);
 
 	e->type = EV_TRY_TO_FREE_PAGES;
-	e->ts_ns = bpf_ktime_get_ns();
+	e->ts_nsec = bpf_ktime_get_ns();
 	e->cpu = bpf_get_smp_processor_id();
 	e->nid = (__u32) bpf_get_numa_node_id();
 	e->order = (__u32) order;
@@ -128,7 +128,7 @@ int BPF_PROG(on_balance_pgdat,
 	if (!e)
 		return 0;
 
-	e->ts_ns = bpf_ktime_get_ns();
+	e->ts_nsec = bpf_ktime_get_ns();
 	e->cpu = bpf_get_smp_processor_id();
 	e->type = EV_BALANCE_PGDAT;
 	e->order = (__u32) order;

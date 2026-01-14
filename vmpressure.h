@@ -25,7 +25,7 @@ enum ev_type {
 };
 
 struct event {
-	__u64 ts_ns;
+	__u64 ts_nsec;
 	__u32 type;
 	__u32 cpu;
 	__u32 nid;
