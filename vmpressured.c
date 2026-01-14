@@ -22,30 +22,36 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <bpf/libbpf.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
 
 #include "vmpressure.h"
 #include "vmpressure.skel.h"
+#include "vmpressured-observer.h"
+
+#define FD_RINGBUF		(1)
+#define FD_TIMERFD		(2)
 
 static volatile sig_atomic_t stop;
+
+static uint64_t now_nsec(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static const char *stnames[PRESSURE_CRITICAL + 1] = {
+	[PRESSURE_OK] = "OK",
+	[PRESSURE_SOFT] = "SOFT",
+	[PRESSURE_HARD] = "HARD",
+	[PRESSURE_CRITICAL] = "CRITICAL",
+};
 
 static void sigint_handler(int signo)
 {
 	(void) signo;
 	stop = 1;
-}
-
-static const char *evname(__u32 t)
-{
-	switch (t) {
-	case 1:
-		return "KSWAPD_WAKE";
-	case 2:
-		return "DIRECT_RECLAIM_BEGIN";
-	case 3:
-		return "BALANCE_PGDAT";
-	default:
-		return "UNKNOWN";
-	}
 }
 
 static long pages_to_kb(long pages)
@@ -56,27 +62,83 @@ static long pages_to_kb(long pages)
 	return (pages * ps) / 1024;
 }
 
+static enum vmpressure_event_cause event_to_cause(const struct event *e)
+{
+	switch (e->type)
+	{
+		case EV_KSWAPD_WAKE: return CAUSE_WAKEUP_KSWAPD;
+		case EV_TRY_TO_FREE_PAGES: return CAUSE_TRY_TO_FREE_PAGES;
+		case EV_BALANCE_PGDAT: return CAUSE_BALANCE_PGDAT;
+		default: return 0;
+	}
+}
+
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
-	(void) ctx;
-	(void) data_sz;
 	const struct event *e = data;
+	struct vmpressure_observer *observer = ctx;
 
-	printf
-	    ("[%s] cpu=%u nid=%u order=%u  free=%ldkB file=%ldkB anon=%ldkB shmem=%ldkB",
-	     evname(e->type), e->cpu, e->nid, e->order,
-	     pages_to_kb(e->nr_free_pages), pages_to_kb(e->nr_file_pages),
-	     pages_to_kb(e->nr_anon_mapped), pages_to_kb(e->nr_shmem));
+	(void) data_sz;
 
-	if (e->nr_slab_reclaimable >= 0)
-		printf(" slab_recl=%ldkB",
-		       pages_to_kb(e->nr_slab_reclaimable));
-	if (e->nr_slab_unreclaimable >= 0)
-		printf(" slab_unrecl=%ldkB",
-		       pages_to_kb(e->nr_slab_unreclaimable));
+	struct vmpressure_event ev = {
+		.cause = event_to_cause(e),
+		.ts_nsec = e->ts_nsec ? e->ts_nsec : now_nsec(),
+		.nid = e->nid,
+		.order = e->order,
+		.snapshot = (struct vmpressure_node_snapshot){
+			.complete = e->nr_free_pages != -1,
+			.free_pages = e->nr_free_pages,
+			.file_pages = e->nr_file_pages,
+			.anon_mapped_pages = e->nr_anon_mapped,
+			.shmem_pages = e->nr_shmem,
+		},
+	};
 
-	printf("\n");
+	vmpressure_observer_ingest(observer, &ev);
+
 	return 0;
+}
+
+static void on_transition(void *ctx, const struct vmpressure_transition *tr)
+{
+	(void) ctx;
+
+	fprintf(stderr, "[%lld] STATE nid=%u %s->%s reason=%u",
+		(long long) tr->event.ts_nsec,
+		tr->event.nid,
+		stnames[tr->old_state],
+		stnames[tr->new_state],
+		tr->event.cause);
+
+	if (tr->event.snapshot.complete) {
+		fprintf(stderr, " free=%lld file=%lld anon=%lld shmem=%lld",
+			(long long)pages_to_kb(tr->event.snapshot.free_pages),
+			(long long)pages_to_kb(tr->event.snapshot.file_pages),
+			(long long)pages_to_kb(tr->event.snapshot.anon_mapped_pages),
+			(long long)pages_to_kb(tr->event.snapshot.shmem_pages));
+	}
+
+	fputc('\n', stderr);
+}
+
+static int make_timerfd(void)
+{
+	int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (tfd < 0)
+		return -errno;
+
+	struct itimerspec its = {};
+	its.it_interval.tv_sec = 1;
+	its.it_value.tv_sec = 1;
+
+	if (timerfd_settime(tfd, 0, &its, NULL) < 0)
+	{
+		int e = -errno;
+		close(tfd);
+		return e;
+	}
+
+	return tfd;
 }
 
 int main(void)
@@ -85,6 +147,30 @@ int main(void)
 	signal(SIGTERM, sigint_handler);
 
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
+
+	struct vmpressure_config cfg = {
+		.nodecount = 4,			// XXX NUMA
+
+		.soft_window_nsec = 10ull*1000000000,
+		.soft_wakeups = 5,
+
+		.hard_window_nsec = 10ull*1000000000,
+		.hard_wakeups = 2,
+
+		.down_from_critical_nsec = 30ull*1000000000,
+		.down_from_hard_nsec = 30ull*1000000000,
+		.down_from_soft_nsec = 60ull*1000000000,
+
+		.recent_wakeup_nsec = 10ull*1000000000,
+		.recent_balance_nsec = 10ull*1000000000,
+	};
+
+	struct vmpressure_observer *observer = NULL;
+	if (vmpressure_observer_init(&observer, &cfg, on_transition, NULL) != 0)
+	{
+		fprintf(stderr, "initializing observer failed\n");
+		return 1;
+	}
 
 	struct vmpressure_bpf *skel = vmpressure_bpf__open();
 	if (!skel) {
@@ -104,24 +190,105 @@ int main(void)
 
 	struct ring_buffer *rb =
 	    ring_buffer__new(bpf_map__fd(skel->maps.events),
-			     handle_event, NULL, NULL);
+			     handle_event, observer, NULL);
 	if (!rb) {
 		fprintf(stderr, "ring_buffer__new: %s\n", strerror(errno));
 		vmpressure_bpf__destroy(skel);
+		vmpressure_observer_fini(observer);
 		return 1;
 	}
 
+	int rb_fd = ring_buffer__epoll_fd(rb);
+	if (rb_fd < 0)
+	{
+		fprintf(stderr, "ring_buffer__epoll_fd: %s\n", strerror(errno));
+		ring_buffer__free(rb);
+		vmpressure_bpf__destroy(skel);
+		vmpressure_observer_fini(observer);
+		return 1;
+	}
+
+	int ep_fd = epoll_create1(EPOLL_CLOEXEC);
+	if (ep_fd < 0)
+	{
+		fprintf(stderr, "epoll_create1: %s\n", strerror(errno));
+		ring_buffer__free(rb);
+		vmpressure_bpf__destroy(skel);
+		vmpressure_observer_fini(observer);
+		return 1;
+	}
+
+	struct epoll_event ev_ringbuf = {
+		.events = EPOLLIN,
+		.data.u32 = FD_RINGBUF,
+	};
+
+	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, rb_fd, &ev_ringbuf) < 0)
+	{
+		fprintf(stderr, "epoll_ctl ringbuf: %s\n", strerror(errno));
+
+		ring_buffer__free(rb);
+		vmpressure_bpf__destroy(skel);
+		vmpressure_observer_fini(observer);
+	}
+
+	int tfd = make_timerfd();
+	struct epoll_event ev_timerfd = {
+		.events = EPOLLIN,
+		.data.u32 = FD_TIMERFD,
+	};
+
+	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, tfd, &ev_timerfd) < 0)
+	{
+		fprintf(stderr, "epoll_ctl timerfd: %s\n", strerror(errno));
+
+		ring_buffer__free(rb);
+		vmpressure_bpf__destroy(skel);
+		vmpressure_observer_fini(observer);
+	}
+
 	while (!stop) {
-		int err = ring_buffer__poll(rb, 500);
-		if (err == -EINTR)
-			break;
-		if (err < 0) {
-			fprintf(stderr, "poll: %d\n", err);
+		struct epoll_event events[8];
+
+		int n = epoll_wait(ep_fd, events, 8, -1);
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+
+			fprintf(stderr, "epoll_wait: %s\n", strerror(errno));
 			break;
 		}
+
+		for (int i = 0; i < n; i++)
+		{
+			switch (events[i].data.u32)
+			{
+				case FD_RINGBUF:
+					int r = ring_buffer__poll(rb, 0);
+					if (r < 0)
+						fprintf(stderr, "process ringbuf: %s\n", strerror(errno));
+					break;
+
+				case FD_TIMERFD:
+					uint64_t expirations;
+					read(tfd, &expirations, sizeof(expirations));
+					vmpressure_observer_tick(observer, now_nsec());
+					break;
+
+				default:
+					break;
+			}
+		}
+
+		fprintf(stderr, "[%lld] CURRENT=%s\n",
+			(long long) now_nsec(),
+			stnames[vmpressure_observer_state(observer)]);
 	}
 
 	ring_buffer__free(rb);
 	vmpressure_bpf__destroy(skel);
+	vmpressure_observer_fini(observer);
+
 	return 0;
 }
