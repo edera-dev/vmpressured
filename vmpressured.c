@@ -141,6 +141,46 @@ static int make_timerfd(void)
 	return tfd;
 }
 
+static int read_max_node_id(uint32_t *out_max_nid)
+{
+	FILE *f = fopen("/sys/devices/system/node/possible", "re");
+	if (f == NULL)
+		return -errno;
+
+	char buf[128];
+	if (!fgets(buf, sizeof(buf), f)) {
+		fclose(f);
+		return -EIO;
+	}
+	fclose(f);
+
+	// Find the largest integer in the string
+	uint32_t max = 0;
+	char *p = buf;
+
+	while (*p)
+	{
+		if (*p >= '0' && *p <= '9')
+		{
+			char *end = NULL;
+			unsigned long v = strtoul(p, &end, 10);
+
+			if (end == p)
+				break;
+
+			if (v > max)
+				max = (uint32_t)v;
+
+			p = end;
+		}
+		else
+			p++;
+	}
+
+	*out_max_nid = max;
+	return 0;
+}
+
 int main(void)
 {
 	signal(SIGINT, sigint_handler);
@@ -148,8 +188,16 @@ int main(void)
 
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
+	uint32_t max_nid = 0;
+	int r = read_max_node_id(&max_nid);
+	if (r < 0)
+	{
+		fprintf(stderr, "failed to read max NUMA node id: %s\n", strerror(-r));
+		return 1;
+	}
+
 	struct vmpressure_config cfg = {
-		.nodecount = 4,			// XXX NUMA
+		.nodecount = max_nid + 1,
 
 		.soft_window_nsec = 10ull*1000000000,
 		.soft_wakeups = 5,
