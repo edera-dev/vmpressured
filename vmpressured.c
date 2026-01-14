@@ -181,10 +181,39 @@ static int read_max_node_id(uint32_t *out_max_nid)
 	return 0;
 }
 
+static int set_oom_score_adj(int adj)
+{
+	FILE *f = fopen("/proc/self/oom_score_adj", "we");
+	if (f == NULL)
+		return -errno;
+
+	if (fprintf(f, "%d\n", adj) < 0)
+	{
+		int e = -errno;
+		fclose(f);
+		return e;
+	}
+
+	if (fclose(f) != 0)
+		return -errno;
+
+	return 0;
+}
+
+static void maybe_protect_from_oom(void)
+{
+	int r = set_oom_score_adj(-1000);
+
+	if (r < 0)
+		fprintf(stderr, "warning: cannot set oom_score_adj: %s\n", strerror(-r));
+}
+
 int main(void)
 {
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
+
+	maybe_protect_from_oom();
 
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
