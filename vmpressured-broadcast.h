@@ -28,6 +28,6 @@ extern void vmpressure_broadcaster_fini(struct vmpressure_broadcaster *broadcast
 extern void vmpressure_broadcaster_send(struct vmpressure_broadcaster *broadcaster,
 					const char *buf, ...);
 
-extern int vmpressure_broadcaster_fd(struct vmpressure_broadcaster *broadcaster);
+extern int vmpressure_broadcaster_fd(const struct vmpressure_broadcaster *broadcaster);
 
 extern int vmpressure_broadcaster_accept(struct vmpressure_broadcaster *broadcaster);
