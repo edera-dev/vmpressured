@@ -63,18 +63,18 @@ struct vmpressure_transition {
 struct vmpressure_config {
 	uint32_t nodecount;
 
-	uint64_t soft_window_ns;
+	uint64_t soft_window_nsec;
 	uint32_t soft_wakeups;
 
-	uint64_t hard_window_ns;
+	uint64_t hard_window_nsec;
 	uint32_t hard_wakeups;
 
-	uint64_t down_from_critical_ns;
-	uint64_t down_from_hard_ns;
-	uint64_t down_from_soft_ns;
+	uint64_t down_from_critical_nsec;
+	uint64_t down_from_hard_nsec;
+	uint64_t down_from_soft_nsec;
 
-	uint64_t recent_wakeup_ns;
-	uint64_t recent_balance_ns;
+	uint64_t recent_wakeup_nsec;
+	uint64_t recent_balance_nsec;
 };
 
 typedef void (*transition_handler_fn)(void *ctx, const struct vmpressure_transition *t);
