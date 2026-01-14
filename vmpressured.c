@@ -28,9 +28,13 @@
 #include "vmpressure.h"
 #include "vmpressure.skel.h"
 #include "vmpressured-observer.h"
+#include "vmpressured-broadcast.h"
 
-#define FD_RINGBUF		(1)
-#define FD_TIMERFD		(2)
+enum fd_tag {
+	FD_RINGBUF = 1,
+	FD_TIMERFD = 2,
+	FD_LISTENER = 3,
+};
 
 static volatile sig_atomic_t stop;
 
@@ -46,6 +50,13 @@ static const char *stnames[PRESSURE_CRITICAL + 1] = {
 	[PRESSURE_SOFT] = "SOFT",
 	[PRESSURE_HARD] = "HARD",
 	[PRESSURE_CRITICAL] = "CRITICAL",
+};
+
+static const char *causes[CAUSE_QUIET_DOWN + 1] = {
+	[CAUSE_WAKEUP_KSWAPD] = "WAKEUP_KSWAPD",
+	[CAUSE_BALANCE_PGDAT] = "BALANCE_PGDAT",
+	[CAUSE_TRY_TO_FREE_PAGES] = "TRY_TO_FREE_PAGES",
+	[CAUSE_QUIET_DOWN] = "QUIET_DOWN",
 };
 
 static void sigint_handler(int signo)
@@ -101,24 +112,34 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 static void on_transition(void *ctx, const struct vmpressure_transition *tr)
 {
-	(void) ctx;
+	struct vmpressure_broadcaster *broadcaster = ctx;
 
-	fprintf(stderr, "[%lld] STATE nid=%u %s->%s reason=%u",
-		(long long) tr->event.ts_nsec,
-		tr->event.nid,
-		stnames[tr->old_state],
-		stnames[tr->new_state],
-		tr->event.cause);
+	printf("event complete=%d\n", tr->event.snapshot.complete);
 
-	if (tr->event.snapshot.complete) {
-		fprintf(stderr, " free=%lld file=%lld anon=%lld shmem=%lld",
+	if (!tr->event.snapshot.complete)
+	{
+		vmpressure_broadcaster_send(broadcaster,
+			"STATE ts=%lld nid=%u old_state=%s new_state=%s reason=%s\n",
+			(long long) tr->event.ts_nsec,
+			tr->event.nid,
+			stnames[tr->old_state],
+			stnames[tr->new_state],
+			causes[tr->event.cause]);
+	}
+	else
+	{
+		vmpressure_broadcaster_send(broadcaster,
+			"STATE ts=%lld nid=%u old_state=%s new_state=%s reason=%s free=%lld file=%lld anon=%lld shmem=%lld\n",
+			(long long) tr->event.ts_nsec,
+			tr->event.nid,
+			stnames[tr->old_state],
+			stnames[tr->new_state],
+			causes[tr->event.cause],
 			(long long)pages_to_kb(tr->event.snapshot.free_pages),
 			(long long)pages_to_kb(tr->event.snapshot.file_pages),
 			(long long)pages_to_kb(tr->event.snapshot.anon_mapped_pages),
 			(long long)pages_to_kb(tr->event.snapshot.shmem_pages));
 	}
-
-	fputc('\n', stderr);
 }
 
 static int make_timerfd(void)
@@ -242,8 +263,15 @@ int main(void)
 		.recent_balance_nsec = 10ull*1000000000,
 	};
 
+	struct vmpressure_broadcaster *broadcaster = NULL;
+	if (vmpressure_broadcaster_init(&broadcaster, "/run/vmpressure.sock") != 0)
+	{
+		fprintf(stderr, "initializing listener failed\n");
+		return 1;
+	}
+
 	struct vmpressure_observer *observer = NULL;
-	if (vmpressure_observer_init(&observer, &cfg, on_transition, NULL) != 0)
+	if (vmpressure_observer_init(&observer, &cfg, on_transition, broadcaster) != 0)
 	{
 		fprintf(stderr, "initializing observer failed\n");
 		return 1;
@@ -324,6 +352,21 @@ int main(void)
 		vmpressure_observer_fini(observer);
 	}
 
+	int lfd = vmpressure_broadcaster_fd(broadcaster);
+	struct epoll_event ev_listener = {
+		.events = EPOLLIN,
+		.data.u32 = FD_LISTENER,
+	};
+
+	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, lfd, &ev_listener) < 0)
+	{
+		fprintf(stderr, "epoll_ctl timerfd: %s\n", strerror(errno));
+
+		ring_buffer__free(rb);
+		vmpressure_bpf__destroy(skel);
+		vmpressure_observer_fini(observer);
+	}
+
 	while (!stop) {
 		struct epoll_event events[8];
 
@@ -342,25 +385,33 @@ int main(void)
 			switch (events[i].data.u32)
 			{
 				case FD_RINGBUF:
+				{
 					int r = ring_buffer__poll(rb, 0);
 					if (r < 0)
 						fprintf(stderr, "process ringbuf: %s\n", strerror(errno));
 					break;
+				}
 
 				case FD_TIMERFD:
+				{
 					uint64_t expirations;
 					read(tfd, &expirations, sizeof(expirations));
 					vmpressure_observer_tick(observer, now_nsec());
 					break;
+				}
+
+				case FD_LISTENER:
+				{
+					int r = vmpressure_broadcaster_accept(broadcaster);
+					if (r < 0)
+						fprintf(stderr, "accept: %s\n", strerror(r));
+					break;
+				}
 
 				default:
 					break;
 			}
 		}
-
-		fprintf(stderr, "[%lld] CURRENT=%s\n",
-			(long long) now_nsec(),
-			stnames[vmpressure_observer_state(observer)]);
 	}
 
 	ring_buffer__free(rb);
